@@ -41,7 +41,7 @@ for now. This is just a view.
 ![map view](screenshots/map-view.jpg)
 
 The map view uses [Nominatim](https://nominatim.org) and
-[Open Street Map](https://openstreetmap.org) databases
+[OpenStreetMap](https://openstreetmap.org) databases
 to geolocate your contacts on a map, in a completely de-googled,
 privacy-compliant, way.
 
