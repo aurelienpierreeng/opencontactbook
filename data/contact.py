@@ -16,18 +16,54 @@
 # You should have received a copy of the GNU General Public License along with Open Contact Book.
 # If not, see <https://www.gnu.org/licenses/>.
 
+from fcntl import F_SEAL_SEAL
 import os
+from numpy import TooHardError
 import pandas as pd
 import re
 import unidecode
 import requests
 import json
+import hashlib
 import country_list
 
 import vobject as vo
 from data.nominatim import Nominatim
 from data.spellcheck import GeoSpellChecker
 from urllib.parse import urlencode
+
+
+def hash_file(path):
+  """Open a file and compute its hash"""
+  BLOCK_SIZE = 65536
+  file_hash = hashlib.sha256()
+
+  with open(path, 'rb') as f:
+    fb = (f.read(BLOCK_SIZE))
+    while len(fb) > 0:
+      file_hash.update(fb)
+      fb = (f.read(BLOCK_SIZE))
+
+  return file_hash.hexdigest()
+
+
+def parse_vcf(content, path):
+  # Remove accentuated characters in vCard tags
+  # Otherwise it makes some vobject fail (actually, the codec lib it uses)
+  # Also… what stupid vCard app allows them ???
+  regex = r"^([A-ZÉÈÊÀÃ\-\;]+):"
+  matches = re.finditer(regex, content, re.MULTILINE)
+
+  for matchNum, match in enumerate(matches):
+    tag = match.group(1)
+    content = content.replace(tag, unidecode.unidecode(tag))
+
+  # Get the inner of the vcard as a Python dict
+  parsed = vo.readOne(content).contents
+  parsed["file"] = os.path.normpath(path)
+  parsed["hash"] = hash_file(path)
+
+  return parsed
 
 
 def list_vcf_in_directory(directory, progress=None, killswitch=None):
@@ -56,28 +92,11 @@ def list_vcf_in_directory(directory, progress=None, killswitch=None):
       break
 
     if file.endswith(".vcf"):
-
       path = os.path.join(directory, file)
       f = open(path, "r")
       content = f.read()
       f.close()
-
-      content.encode(encoding='UTF-8', errors='strict')
-
-      # Remove accentuated characters in vCard tags
-      # Otherwise it makes some vobject fail (actually, the codec lib it uses)
-      # Also… what stupid vCard app allows them ???
-      regex = r"^([A-ZÉÈÊÀÃ\-\;]+):"
-      matches = re.finditer(regex, content, re.MULTILINE)
-
-      for matchNum, match in enumerate(matches):
-        tag = match.group(1)
-        content = content.replace(tag, unidecode.unidecode(tag))
-
-      # Get the inner of the vcard as a Python dict
-      parsed = vo.readOne(content).contents
-      parsed["file"] = path
-      contacts.append(parsed)
+      contacts.append(parse_vcf(content, path))
 
   if progress is not None:
     progress.emit((current_file, files_number, files_number, "Parsing files", "Reading directory"))
@@ -85,7 +104,83 @@ def list_vcf_in_directory(directory, progress=None, killswitch=None):
   # Collapse this into a database, aka Pandas DataFrame
   data = pd.DataFrame(contacts)
 
-  return data
+  # Mark all fields for geolocation update
+  data["geoupdate"] = True
+
+  return data.astype(str)
+
+
+def update_vcf_in_directory(directory, dataframe, progress=None, killswitch=None):
+  """
+  Thread-safe address book building
+  :param progress: Qt Worker Signal to emit progress info
+  :param killswitch: Thread-safe boolean stopping the process if == True
+  """
+  all_files = os.listdir(directory)
+  files_number = len(all_files)
+  current_file = 0
+
+  # Walk the directory to find al files
+  for file in sorted(all_files):
+
+    # Update the progress bar if any
+    if progress is not None:
+      progress.emit((current_file, 0, files_number, "Parsing files", "Reading directory"))
+      current_file += 1
+
+    # Abort and update the progress bar on killswitch
+    if killswitch is not None and killswitch.is_set():
+      if progress is not None:
+        progress.emit((current_file, 0, current_file, files_number, "cancel", "Reading directory"))
+      break
+
+    if file.endswith(".vcf"):
+      path = os.path.join(directory, file)
+      f = open(path, "r")
+      content = f.read()
+      f.close()
+
+      # Look if the file is already in DB
+      query = dataframe[dataframe["file"] == os.path.normpath(path)]
+      if len(query.index) == 1:
+        # File already in DB : check for changes
+        hash = hash_file(path)
+        if(hash != query.iloc[0]["hash"]):
+          print("updating", path)
+
+          # Create a new dataframe with one row at the same index as the DB match
+          new_line = pd.DataFrame(parse_vcf(content, path), index=query.index).astype(str)
+          new_line["geoupdate"] = True
+
+          # Merge the new line within DB: this will update the existing matching row of the DB match
+          # and will also add a new global column in DB if a new tag is found in the .vcf
+          dataframe = pd.merge(dataframe, new_line, how="left")
+
+        else:
+          pass
+          # nothing to do, file didn't change
+
+      elif len(query.index) == 0:
+        print("adding", path)
+        # File not found in DB : add it now
+        # Create a new dataframe with one row and new index
+        new_line = pd.DataFrame(parse_vcf(content, path)).astype(str)
+        new_line["geoupdate"] = True
+
+        # Append the new line within DB and add a new global column
+        # in DB if a new tag is found in the .vcf
+        dataframe = pd.concat([dataframe, new_line], axis=0, ignore_index=True)
+
+      else:
+        # We have more than one line for this file
+        # Someone tampered with our database
+        raise ValueError("Undefined behaviour: we have more than one record in database for %s, this should never happen" % path)
+
+  if progress is not None:
+    progress.emit((current_file, files_number, files_number, "Parsing files", "Reading directory"))
+
+  return dataframe
+
 
 
 def cleanup_contact(data, progress=None, killswitch=None):
@@ -93,6 +188,9 @@ def cleanup_contact(data, progress=None, killswitch=None):
   Thread-safe address book building
   :param progress: Qt Worker Signal to emit progress info
   """
+
+  # Backup the file names as-is
+  files = data["file"]
 
   if progress is not None:
     progress.emit((0, 0, 3, "Formatting the database", "Prepare data"))
@@ -136,6 +234,9 @@ def cleanup_contact(data, progress=None, killswitch=None):
 
   cols = forced_cols_start + original_cols
   data = data.reindex(columns=cols)
+
+  # Restore files
+  data["file"] = files
 
   if progress is not None:
     progress.emit((3, 0, 3, "Sorted", "Prepare data"))
@@ -206,6 +307,11 @@ def get_geoID(data, progress=None, killswitch=None):
       if progress is not None:
         progress.emit((index, 0, index, "cancel", "Fetch geolocation data"))
       break
+
+    # If geolocation has already been found
+    if "geoupdate" in data.columns:
+      if data.loc[index, "geoupdate"] == "False":
+        continue
 
     result = []
 
@@ -296,6 +402,7 @@ def get_geoID(data, progress=None, killswitch=None):
     else:
       data.loc[index, "geoID"] = "not found"
     data.loc[index, "exactlocation"] = flag_accurate
+    data.loc[index, "geoupdate"] = False
 
   if progress is not None:
     progress.emit((index, entries, entries, "cancel", "Fetch geolocation data"))

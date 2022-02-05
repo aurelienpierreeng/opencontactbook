@@ -8,3 +8,4 @@ python -m pip install Unidecode
 python -m pip install folium
 python -m pip install country_list
 python -m pip install urllib3
+pythom -m pip install hashlib

@@ -19,6 +19,7 @@
 import random
 import sys
 import io
+import os
 import traceback
 import threading
 import json
@@ -57,7 +58,20 @@ class AppWindow(QMainWindow):
     # Get the VCF files
     self.startProgress()
     self.event_stop.clear()
-    worker = Worker(self.mutex, self.wait, self.event_stop, contact.list_vcf_in_directory, self.preferences["directory"])
+    worker = Worker(self.mutex, self.wait, self.event_stop, contact.list_vcf_in_directory, self.preferences.dict["directory"])
+    worker.signals.result.connect(self.set_address_book)
+    worker.signals.progress.connect(self.updateProgress)
+    worker.signals.finished.connect(self.spawn_clean_contacts_db_thread)
+    self.threadpool.start(worker)
+
+  def spawn_vcf_update_thread(self):
+    # Get the VCF files
+    self.startProgress()
+    self.event_stop.clear()
+    worker = Worker(self.mutex, self.wait, self.event_stop,
+                    contact.update_vcf_in_directory,
+                    self.preferences.dict["directory"],
+                    self.addressbook.addressDB)
     worker.signals.result.connect(self.set_address_book)
     worker.signals.progress.connect(self.updateProgress)
     worker.signals.finished.connect(self.spawn_clean_contacts_db_thread)
@@ -81,8 +95,17 @@ class AppWindow(QMainWindow):
     self.threadpool.start(worker)
 
   def build_address_book(self):
-    self.spawn_vcf_files_thread()
-    # All other functions are called from the threads finished event
+    # Look for a cached DB from a previous run
+    file_name = os.path.basename(os.path.normpath(self.preferences.dict["directory"]))
+    data_path = os.path.join(self.preferences.pref_path, file_name)
+
+    if os.path.isfile(data_path):
+      data = pd.read_pickle(data_path)
+      self.set_address_book(data)
+      self.spawn_vcf_update_thread()
+      print("updating DB")
+    else:
+      self.spawn_vcf_files_thread()
 
   def make_tree_view(self):
     # Create the data model with the view
@@ -91,10 +114,10 @@ class AppWindow(QMainWindow):
     self.update()
 
   def open_local_directory(self):
-    self.preferences["directory"] = QFileDialog.getExistingDirectory(self, self.tr("Open Directory"),
+    self.preferences.dict["directory"] = QFileDialog.getExistingDirectory(self, self.tr("Open Directory"),
                                     "/home",
                                     QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks)
-    self.preferences["method"] = "local directory"
+    self.preferences.dict["method"] = "local directory"
 
   def set_file_menu(self):
     #self.fileMenu.addAction(self.tr("Open a book from a single file (.vcf)"), self.open_local_directory)
@@ -181,15 +204,14 @@ class AppWindow(QMainWindow):
       self.update()
 
 
-  def __init__(self, pref_file):
+  def __init__(self, base_dir=""):
     super().__init__()
     self.setWindowTitle(utils.get_app_name())
     self.setWindowIcon(QIcon(utils.get_app_icon()))
     self.setWindowState(Qt.WindowMaximized)
     self.set_menu()
 
-    self.pref_file = pref_file
-    self.preferences = preferences.read_preferences(pref_file)
+    self.preferences = preferences.OCBPreferences(base_dir)
 
     # Threading, mutex and waiting conditions
     # Lock the mutex and wait for it each time you work on the data in a thread
@@ -226,10 +248,7 @@ class AppWindow(QMainWindow):
     self.webView = QWebEngineView(self.tabMap)
     layout.addWidget(self.webView)
 
-
     #self.webView = QQuickWidget()
-
-
     #self.webView.setInitialProperties({"myModel": my_model})
 
     #Load the QML file
@@ -240,7 +259,13 @@ class AppWindow(QMainWindow):
     # save map data to data object
     self.mapBuffer = io.BytesIO()
 
-    if "directory" not in self.preferences:
+    # Create global signals and connect their callbacks
+    self.signals = GuiEvents()
+    self.signals.DataChanged.connect(self.make_tree_view)
+    self.signals.DataChanged.connect(self.add_map_markers)
+
+    # Finally, try to load some data
+    if "directory" not in self.preferences.dict:
       self.emptyPrompt = QLabel(self.tr("Please open a contact book to start"))
       self.emptyPrompt.setAlignment(Qt.AlignCenter)
       self.setCentralWidget(self.emptyPrompt)
@@ -249,20 +274,18 @@ class AppWindow(QMainWindow):
       self.build_address_book()
 
 
-    # Create global signals and connect their callbacks
-    self.signals = GuiEvents()
-    self.signals.DataChanged.connect(self.make_tree_view)
-    self.signals.DataChanged.connect(self.add_map_markers)
-
-
   def closeEvent(self, event):
-    preferences.write_preferences(self.pref_file, self.preferences)
+    # Save preferences
+    self.preferences.write_preferences()
+
+    # Save the dataframe for later use
+    file_name = os.path.basename(os.path.normpath(self.preferences.dict["directory"]))
+    data_path = os.path.join(self.preferences.pref_path, file_name)
+    self.addressbook.addressDB.to_pickle(data_path)
 
 
-def GUI_Start(pref_file):
+def GUI_Start(base_dir=""):
   app = QApplication([])
-
-  widget = AppWindow(pref_file)
+  widget = AppWindow(base_dir="")
   widget.show()
-
   sys.exit(app.exec())

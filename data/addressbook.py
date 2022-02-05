@@ -24,7 +24,7 @@ class addressDB(pd.DataFrame):
 
 
 class addressBook():
-  def __init__(self, *args, hidden_cols=["uid", "prodid", "rev", "file", "version"], **kargs):
+  def __init__(self, *args, hidden_cols=[], **kargs):
     # addressDB contains the whole contacts book as fetched on disk
     self._addressDB = addressDB(*args, **kargs)
 
