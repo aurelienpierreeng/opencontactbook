@@ -100,10 +100,12 @@ class AppWindow(QMainWindow):
     data_path = os.path.join(self.preferences.pref_path, file_name)
 
     if os.path.isfile(data_path):
-      data = pd.read_pickle(data_path)
+      # Load the cached DB
+      data = pd.read_pickle(data_path).astype(str)
       self.set_address_book(data)
+
+      # Update files
       self.spawn_vcf_update_thread()
-      print("updating DB")
     else:
       self.spawn_vcf_files_thread()
 
