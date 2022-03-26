@@ -17,7 +17,6 @@
 # If not, see <https://www.gnu.org/licenses/>.
 
 import os
-from numpy import TooHardError
 import pandas as pd
 import re
 import unidecode
